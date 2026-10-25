@@ -29,13 +29,21 @@ def main():
         name = path.rsplit(".", 1)[0]
         ax1.plot(d["t"], d["error"], label=name)
         ax2.plot(d["t"], d["alt"], label=name)
-        line, = ax3.plot(d["y"], d["x"], label=f"{name} (drone)")
-        ax3.plot(d["ty"], d["tx"], "--", color=line.get_color(), alpha=0.5)
+        # har run apni start position se naapo, taaki sab ek jagah se shuru hon
+        x0, y0 = d["x"][0], d["y"][0]
+        rx = [v - x0 for v in d["x"]]
+        ry = [v - y0 for v in d["y"]]
+        rtx = [v - x0 for v in d["tx"]]
+        rty = [v - y0 for v in d["ty"]]
+        line, = ax3.plot(ry, rx, label=f"{name} (drone)")
+        ax3.plot(rty, rtx, "--", color=line.get_color(), alpha=0.5)
+        ax3.plot(ry[-1], rx[-1], "x", color=line.get_color(), ms=9)
 
     ax1.set(title="Target se error", xlabel="time (s)", ylabel="error (m)")
     ax1.axhline(0.5, color="gray", ls=":", lw=1)
     ax2.set(title="Height", xlabel="time (s)", ylabel="height (m)")
-    ax3.set(title="Upar se path (dashed = target)", xlabel="East (m)", ylabel="North (m)")
+    ax3.set(title="Upar se path (start = 0,0; dashed = target; x = end)",
+            xlabel="East from start (m)", ylabel="North from start (m)")
     ax3.set_aspect("equal", adjustable="datalim")
     for ax in (ax1, ax2, ax3):
         ax.grid(alpha=0.3)
