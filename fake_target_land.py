@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-STAGE 1 - Fake target pe closed-loop precision landing (ArduPilot SITL)
+STAGE 1 - Closed-loop precision landing on a simulated target (ArduPilot SITL)
 
-Ye script wo karta hai jo QGC nahi kar sakta:
-har 0.1 second pe drone ki position padhta hai, target se galti (error)
-nikalta hai, aur us hisaab se velocity command bhejta hai. Jab drone target
-ke upar centre ho jaata hai, tab dheere-dheere neeche utarta hai.
+Every ~0.1 s the script reads the drone's position, computes the error to the
+target, and sends a velocity command to close it. The drone only descends
+while it is centred over the target.
 
-Baad mein (Stage 3) "fake target" ki jagah webcam + ArUco ka output lagega.
-
-Chalane ka tareeka:
+Run:
   Terminal 1:  cd ~/ardupilot && sim_vehicle.py -v ArduCopter
   Terminal 2:  python3 fake_target_land.py
-               python3 fake_target_land.py --move            (target ghoomta rahega)
-               python3 fake_target_land.py --move --ff       (feedforward ON)
-               python3 fake_target_land.py --move --log p.csv (log ka naam)
+               python3 fake_target_land.py --move              (target moves on a circle)
+               python3 fake_target_land.py --move --ff         (feedforward on)
+               python3 fake_target_land.py --jump 0.8          (target jumps 0.8 m near the ground)
+               python3 fake_target_land.py --jump 0.8 --cone   (same, with the landing cone)
+               python3 fake_target_land.py --log run.csv       (log file name)
 
-Safety: Ctrl+C dabane pe drone LAND karega. Centre na ho paaye ya
-flight bahut lambi ho jaaye to RTL.
+Safety: Ctrl+C makes the drone LAND. If it cannot centre, or the flight is too
+long, it switches to RTL.
 
-Connection: default tcp:127.0.0.1:5762 (SITL ka doosra port), taaki
-MAVProxy aur QGC wala connection disturb na ho.
+Connection: default tcp:127.0.0.1:5762 (SITL's second port), so MAVProxy and
+QGC keep their own connection.
 """
 
 import argparse
@@ -29,19 +28,26 @@ import time
 
 from pymavlink import mavutil
 
-# ---- Tuning (yahin se behaviour badlo) ----
-KP = 0.5            # error (m) -> speed (m/s). Bada = tez, par overshoot ka risk
+# ---- Tuning ----
+KP = 0.5            # error (m) -> speed (m/s). Higher = faster, but overshoots
 VMAX = 3.0          # horizontal speed limit (m/s)
-START_TOL = 0.5     # error isse kam ho to utarna SHURU karo (m)
-STOP_TOL = 1.0      # error isse zyada ho jaaye tabhi utarna ROKO (m)  -> hysteresis
-DESCENT_SPEED = 0.6 # neeche utarne ki speed (m/s)
-SLOW_ALT = 2.0      # isse neeche aakar dheere utro
+START_TOL = 0.5     # start descending when error is below this (m)
+STOP_TOL = 1.0      # stop descending when error goes above this (m) -> hysteresis
+DESCENT_SPEED = 0.6 # descent speed (m/s)
+SLOW_ALT = 2.0      # below this height, descend slowly
 SLOW_DESCENT = 0.3  # (m/s)
-LAND_ALT = 0.5      # is height tak tracking chalu, phir LAND mode (m)
-CENTER_TIMEOUT = 45 # itne second mein centre nahi hua to RTL (safety)
-MAX_FLIGHT = 180    # poori flight ki upper limit, phir RTL (safety)
+LAND_ALT = 0.5      # track the target down to this height, then LAND mode (m)
+CENTER_TIMEOUT = 45 # not centred within this time (s) -> RTL
+MAX_FLIGHT = 180    # whole flight limit (s) -> RTL
 
-# velocity-only command: position, acceleration, yaw, yaw-rate ignore
+# ---- Landing cone (--cone) ----
+# The allowed error shrinks with height: generous up high, strict near the ground.
+CONE_SLOPE = 0.05   # allowed start error per metre of height (0.5 m at 10 m)
+CONE_MIN = 0.15     # never stricter than this (m), or noise would stop every descent
+RETRY_ALT = 1.5     # off-target below this height -> climb back up to it
+RETRY_CLIMB = 0.5   # climb speed for a retry (m/s)
+
+# velocity-only command: ignore position, acceleration, yaw, yaw rate
 VEL_ONLY_MASK = 0b0000110111000111
 MODES = {}
 
@@ -52,7 +58,7 @@ def log_statustext(msg):
 
 
 def recv(m, msg_type, timeout=1.0):
-    """msg_type aane tak messages padho; beech mein STATUSTEXT print karo."""
+    """Read until msg_type arrives; print any STATUSTEXT on the way."""
     end = time.time() + timeout
     types = [msg_type, "STATUSTEXT"] if isinstance(msg_type, str) else list(msg_type) + ["STATUSTEXT"]
     while time.time() < end:
@@ -80,7 +86,7 @@ def is_armed(hb):
 
 
 def wait_vehicle(m, timeout=30):
-    """Sirf asli drone ki heartbeat pakdo (QGC/MAVProxy jaise GCS ki nahi)."""
+    """Lock onto the vehicle's heartbeat (ignore ground stations like QGC/MAVProxy)."""
     end = time.time() + timeout
     while time.time() < end:
         hb = m.recv_match(type="HEARTBEAT", blocking=True, timeout=2)
@@ -92,7 +98,7 @@ def wait_vehicle(m, timeout=30):
             m.target_system = hb.get_srcSystem()
             m.target_component = hb.get_srcComponent()
             return mavutil.mode_mapping_byname(hb.type)
-    raise RuntimeError("Drone ki heartbeat nahi mili. SITL chal raha hai?")
+    raise RuntimeError("No vehicle heartbeat. Is SITL running?")
 
 
 def set_mode(m, name, timeout=10):
@@ -104,11 +110,11 @@ def set_mode(m, name, timeout=10):
         if hb and hb.custom_mode == mode_id:
             print(f"Mode: {name}")
             return
-    raise RuntimeError(f"Mode {name} set nahi hua")
+    raise RuntimeError(f"Could not set mode {name}")
 
 
 def arm(m, timeout=90):
-    print("Arm kar rahe hain (GPS/EKF ready hone tak retry hoga)...")
+    print("Arming (retrying until GPS/EKF are ready)...")
     end = time.time() + timeout
     while time.time() < end:
         m.mav.command_long_send(
@@ -120,7 +126,7 @@ def arm(m, timeout=90):
             print("ARMED")
             return
         time.sleep(1)
-    raise RuntimeError("Arm nahi hua. Upar [drone] PreArm messages dekho.")
+    raise RuntimeError("Arming failed. Check the [drone] PreArm messages above.")
 
 
 def takeoff(m, alt, timeout=40):
@@ -134,10 +140,10 @@ def takeoff(m, alt, timeout=40):
     last_alt, last_change = 0.0, time.time()
     while True:
         if time.time() - t0 > timeout:
-            raise RuntimeError("Takeoff timeout. Upar [drone] messages aur QGC dekho.")
+            raise RuntimeError("Takeoff timeout. Check the [drone] messages and QGC.")
         pos = recv(m, "LOCAL_POSITION_NED", timeout=2)
         if pos is None:
-            print("  (position message nahi aa raha...)")
+            print("  (no position message...)")
             continue
         cur = -pos.z
         if time.time() - last_print > 1.0:
@@ -145,14 +151,14 @@ def takeoff(m, alt, timeout=40):
             last_print = time.time()
         if abs(cur - last_alt) > 0.1:
             last_alt, last_change = cur, time.time()
-        # 90% tak pahunch gaya, YA climb 3 second se ruka hua hai (aur 50% se upar hai)
+        # reached 90%, OR the climb has stalled for 3 s above 50%
         if cur >= alt * 0.90 or (cur > alt * 0.5 and time.time() - last_change > 3):
             print(f"Takeoff complete: {cur:.1f} m")
             return
 
 
 def send_velocity(m, vx, vy, vz):
-    """NED frame: vx = North, vy = East, vz = Down (positive = neeche)."""
+    """NED frame: vx = North, vy = East, vz = Down (positive = descend)."""
     m.mav.set_position_target_local_ned_send(
         0, m.target_system, m.target_component,
         mavutil.mavlink.MAV_FRAME_LOCAL_NED, VEL_ONLY_MASK,
@@ -163,28 +169,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--connect", default="tcp:127.0.0.1:5762")
     ap.add_argument("--alt", type=float, default=10.0, help="takeoff height (m)")
-    ap.add_argument("--north", type=float, default=8.0, help="target kitna North (m)")
-    ap.add_argument("--east", type=float, default=5.0, help="target kitna East (m)")
-    ap.add_argument("--move", action="store_true", help="target ko circle mein ghumao")
-    ap.add_argument("--ff", action="store_true", help="feedforward on (target velocity jodo)")
-    ap.add_argument("--log", default=None, help="CSV log file ka naam (default: log_HHMMSS.csv)")
+    ap.add_argument("--north", type=float, default=8.0, help="target offset North (m)")
+    ap.add_argument("--east", type=float, default=5.0, help="target offset East (m)")
+    ap.add_argument("--move", action="store_true", help="target moves on a circle")
+    ap.add_argument("--ff", action="store_true", help="feedforward (add target velocity)")
+    ap.add_argument("--cone", action="store_true", help="landing cone: allowed error shrinks with height")
+    ap.add_argument("--jump", type=float, default=0.0,
+                    help="target jumps this far East (m) when the drone first descends below --jump-alt")
+    ap.add_argument("--jump-alt", type=float, default=1.2, help="height for --jump (m)")
+    ap.add_argument("--log", default=None, help="CSV log file name (default: log_HHMMSS.csv)")
     args = ap.parse_args()
 
     print(f"Connecting {args.connect} ...")
     m = mavutil.mavlink_connection(args.connect)
     global MODES
     MODES = wait_vehicle(m)
-    print(f"Drone mila (system {m.target_system}, component {m.target_component})")
+    print(f"Vehicle found (system {m.target_system}, component {m.target_component})")
 
     request_rate(m, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 10)
     request_rate(m, mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT, 2)
 
-    # Pichla run Ctrl+C se band hua ho to drone already hawa mein ho sakta hai
+    # If a previous run was stopped, the drone may still be in the air
     hb = recv(m, "HEARTBEAT", timeout=3)
     pos0 = recv(m, "LOCAL_POSITION_NED", timeout=3)
     set_mode(m, "GUIDED")
     if hb and is_armed(hb) and pos0 and -pos0.z > 2.0:
-        print(f"Drone already hawa mein hai ({-pos0.z:.1f} m). Takeoff skip.")
+        print(f"Already airborne ({-pos0.z:.1f} m), skipping takeoff.")
     else:
         arm(m)
         takeoff(m, args.alt)
@@ -194,33 +204,59 @@ def main():
     log.write("t,error,alt,tx,ty,x,y,vx,vy,vz,descending\n")
     print(f"Log: {log_name}")
 
+    target = None
     try:
-        fly(m, args, log)
+        target = fly(m, args, log)
     except KeyboardInterrupt:
-        # Script band ho raha hai -> drone ko hawa mein latka mat chhodo
-        print("\nCtrl+C! Drone ko LAND mode de rahe hain...")
+        # never leave the drone hovering when the script stops
+        print("\nCtrl+C! Switching to LAND...")
         set_mode(m, "LAND")
     finally:
         log.close()
 
+    wait_disarm(m, target)
+
+
+def wait_disarm(m, target=None):
+    """Wait for touchdown; report where the drone actually landed."""
+    last = None
     while True:
-        hb = recv(m, "HEARTBEAT", timeout=2)
-        if hb and not is_armed(hb):
+        msg = recv(m, ["HEARTBEAT", "LOCAL_POSITION_NED"], timeout=2)
+        if msg is None:
+            continue
+        if msg.get_type() == "LOCAL_POSITION_NED":
+            last = msg
+        elif not is_armed(msg):
+            if target and last:
+                err = math.hypot(target[0] - last.x, target[1] - last.y)
+                print(f"Touchdown error: {err:.2f} m")
             print("Landed + DISARMED. Done.")
-            break
+            return
+
+
+def tolerances(alt, cone):
+    """(start, stop) descent tolerances in metres for this height."""
+    if not cone:
+        return START_TOL, STOP_TOL
+    start = min(START_TOL, max(CONE_MIN, CONE_SLOPE * alt))
+    return start, 2 * start
 
 
 def fly(m, args, log):
     start = recv(m, "LOCAL_POSITION_NED", timeout=3)
     cx, cy = start.x + args.north, start.y + args.east
-    print(f"Target: start se {args.north} m North, {args.east} m East"
+    print(f"Target: {args.north} m North, {args.east} m East of start"
           + ("  (moving)" if args.move else "")
-          + ("  [feedforward ON]" if args.ff else ""))
+          + ("  [feedforward ON]" if args.ff else "")
+          + ("  [cone ON]" if args.cone else "")
+          + (f"  [jump {args.jump} m at {args.jump_alt} m]" if args.jump else ""))
 
     t0 = time.time()
     last_print = 0.0
     descending = False
     ever_centered = False
+    jumped = False
+    retrying = False
     while True:
         pos = recv(m, "LOCAL_POSITION_NED", timeout=1)
         if pos is None:
@@ -229,25 +265,33 @@ def fly(m, args, log):
 
         # ---- SAFETY ----
         if not ever_centered and t > CENTER_TIMEOUT:
-            print(f"SAFETY: {CENTER_TIMEOUT}s mein centre nahi hua -> RTL")
+            print(f"SAFETY: not centred within {CENTER_TIMEOUT}s -> RTL")
             set_mode(m, "RTL")
-            return
+            return None
         if t > MAX_FLIGHT:
             print(f"SAFETY: {MAX_FLIGHT}s flight limit -> RTL")
             set_mode(m, "RTL")
-            return
+            return None
 
-        # ---- target kahan hai (Stage 3 mein ye camera se aayega) ----
+        alt = -pos.z
+
+        # ---- disturbance: target jumps near the ground ----
+        if args.jump and not jumped and descending and alt < args.jump_alt:
+            cy += args.jump
+            jumped = True
+            print(f"t={t:5.1f}s  TARGET JUMPED {args.jump} m East at height {alt:.1f} m")
+
+        # ---- where is the target (Stage 3: from the camera) ----
         if args.move:
             w = 2 * math.pi / 60.0          # angular speed (rad/s)
             tx = cx + 4.0 * math.cos(w * t)
             ty = cy + 4.0 * math.sin(w * t)
-            # target ki velocity = position ka derivative
+            # target velocity = derivative of its position
             tvx = -4.0 * w * math.sin(w * t)
             tvy = 4.0 * w * math.cos(w * t)
         else:
             tx, ty = cx, cy
-            tvx, tvy = 0.0, 0.0             # ruka hua target
+            tvx, tvy = 0.0, 0.0             # target at rest
 
         # ---- error -> velocity (P + feedforward + speed limit) ----
         ex, ey = tx - pos.x, ty - pos.y
@@ -260,15 +304,23 @@ def fly(m, args, log):
         if speed > VMAX:
             vx, vy = vx * VMAX / speed, vy * VMAX / speed
 
-        # ---- hysteresis: shuru aur rokne ki alag seema ----
-        if not descending and dist < START_TOL:
+        # ---- hysteresis (and landing cone if --cone) ----
+        start_tol, stop_tol = tolerances(alt, args.cone)
+        if not descending and dist < start_tol and not retrying:
             descending = True
             ever_centered = True
-        elif descending and dist > STOP_TOL:
+        elif descending and dist > stop_tol:
             descending = False
+            if args.cone and alt < RETRY_ALT:
+                retrying = True
+                print(f"t={t:5.1f}s  RETRY: {dist:.2f} m off at {alt:.1f} m -> climbing to {RETRY_ALT} m")
 
-        alt = -pos.z
-        if descending:
+        if retrying and alt >= RETRY_ALT:
+            retrying = False
+
+        if retrying:
+            vz = -RETRY_CLIMB            # negative = climb
+        elif descending:
             vz = SLOW_DESCENT if alt < SLOW_ALT else DESCENT_SPEED
         else:
             vz = 0.0
@@ -278,15 +330,15 @@ def fly(m, args, log):
                   f"{pos.x:.3f},{pos.y:.3f},{vx:.3f},{vy:.3f},{vz:.3f},{int(descending)}\n")
 
         if t - last_print > 1.0:
-            state = "UTAR RAHA" if descending else "CENTRE KAR RAHA"
+            state = "RETRY" if retrying else ("DESCENDING" if descending else "CENTRING")
             print(f"t={t:5.1f}s  error={dist:5.2f} m  height={alt:5.1f} m  {state}")
             last_print = t
 
-        # tracking LAND_ALT tak chalu rehti hai, phir LAND
+        # track the target down to LAND_ALT, then LAND
         if alt < LAND_ALT and descending:
             print(f"Final error {dist:.2f} m at {alt:.1f} m -> LAND mode")
             set_mode(m, "LAND")
-            return
+            return tx, ty
 
 if __name__ == "__main__":
     main()

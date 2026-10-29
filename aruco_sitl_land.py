@@ -64,6 +64,7 @@ class Shared:
         self.status = "starting"
         self.stop = False
         self.done = False        # control thread finished (landed / RTL)
+        self.target = None       # target position when LAND started
 
 
 def control_loop(m, args, shared, log):
@@ -71,6 +72,7 @@ def control_loop(m, args, shared, log):
     cx, cy = start.x, start.y
     t0 = time.time()
     descending = False
+    retrying = False
     last_print = 0.0
     try:
         while not shared.stop:
@@ -124,11 +126,19 @@ def control_loop(m, args, shared, log):
             if speed > ftl.VMAX:
                 vx, vy = vx * ftl.VMAX / speed, vy * ftl.VMAX / speed
 
-            if not descending and dist < ftl.START_TOL and t > args.hover:
+            start_tol, stop_tol = ftl.tolerances(alt, args.cone)
+            if not descending and dist < start_tol and t > args.hover and not retrying:
                 descending = True
-            elif descending and dist > ftl.STOP_TOL:
+            elif descending and dist > stop_tol:
                 descending = False
-            if descending:
+                if args.cone and alt < ftl.RETRY_ALT:
+                    retrying = True
+                    print(f"t={t:5.1f}s  RETRY: {dist:.2f} m off at {alt:.1f} m -> climbing to {ftl.RETRY_ALT} m")
+            if retrying and alt >= ftl.RETRY_ALT:
+                retrying = False
+            if retrying:
+                vz = -ftl.RETRY_CLIMB
+            elif descending:
                 vz = ftl.SLOW_DESCENT if alt < ftl.SLOW_ALT else ftl.DESCENT_SPEED
             else:
                 vz = 0.0
@@ -137,7 +147,8 @@ def control_loop(m, args, shared, log):
             log.write(f"{t:.2f},{dist:.3f},{alt:.2f},{tx:.3f},{ty:.3f},"
                       f"{pos.x:.3f},{pos.y:.3f},{vx:.3f},{vy:.3f},{vz:.3f},{int(descending)}\n")
 
-            phase = "DESCENDING" if descending else ("FOLLOWING" if t <= args.hover else "CENTRING")
+            phase = ("RETRY" if retrying else "DESCENDING" if descending
+                     else "FOLLOWING" if t <= args.hover else "CENTRING")
             status = phase + f"  err {dist:4.2f} m  h {alt:4.1f} m"
             with shared.lock:
                 shared.status = status
@@ -148,6 +159,7 @@ def control_loop(m, args, shared, log):
             if alt < ftl.LAND_ALT and descending:
                 print(f"Final error {dist:.2f} m at {alt:.1f} m -> LAND")
                 ftl.set_mode(m, "LAND")
+                shared.target = (tx, ty)
                 return
     finally:
         shared.done = True
@@ -163,6 +175,7 @@ def main():
     ap.add_argument("--alt", type=float, default=10.0)
     ap.add_argument("--gain", type=float, default=GAIN)
     ap.add_argument("--ff", action="store_true", help="feedforward from estimated marker velocity")
+    ap.add_argument("--cone", action="store_true", help="landing cone: allowed error shrinks with height")
     ap.add_argument("--hover", type=float, default=0.0,
                     help="only follow (no descent) for the first N seconds - use for follow tests")
     ap.add_argument("--log", default=None)
@@ -268,11 +281,7 @@ def main():
         print("Stopped by user -> LAND")
         ftl.set_mode(m, "LAND")
 
-    while True:
-        hb = ftl.recv(m, "HEARTBEAT", timeout=2)
-        if hb and not ftl.is_armed(hb):
-            print("Landed + DISARMED. Done.")
-            break
+    ftl.wait_disarm(m, shared.target)
 
 
 if __name__ == "__main__":

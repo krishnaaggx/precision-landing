@@ -2,7 +2,9 @@
 
 A closed-loop controller that flies an ArduCopter drone over a target and lands on it, written in Python with `pymavlink` and tested in ArduPilot's Software-In-The-Loop (SITL) simulator.
 
-This is Stage 1 of a camera-based precision landing project. Here the target position is simulated; in Stage 2 it comes from an ArUco marker detected by a camera.
+- **Stage 1:** the target position is simulated (fixed or moving on a circle).
+- **Stage 2:** an ArUco marker is detected with a webcam and its position estimated.
+- **Stage 3:** the webcam detection drives the simulated drone in real time.
 
 ## What it does
 
@@ -43,12 +45,51 @@ The target moves on a 4 m radius circle at 0.42 m/s.
 - Raising Kp reduces the lag but causes overshoot. With real sensor noise and delay this would get worse.
 - Feedforward removes almost all of the lag without raising Kp. The ~4 cm that is left comes from the one-loop delay between reading the position and the drone responding.
 
+## Stage 3: a real camera drives the simulated drone
+
+`aruco_sitl_land.py` detects an ArUco marker held in front of a laptop webcam. The marker's offset from the camera centre (scaled by a gain) becomes the target for the same controller as Stage 1. Moving the marker 15 cm moves the target 1.5 m (gain 10).
+
+**Camera calibration (Stage 2):** the marker distance was checked against a tape measure at 35.5, 51 and 90 cm. The estimate was consistently 3.4% short at all three distances, which points to the assumed field of view rather than lens distortion. Correcting the horizontal FOV from 70 to 68.2 degrees fixed it.
+
+**What the tests showed:**
+
+| Test | Result |
+|---|---|
+| Marker held still | Lands within ~0.03 m of the target |
+| Marker hidden for up to 6 s | Drone hovers and stops descending, then resumes when the marker returns |
+| Marker moved in 15 cm steps during descent | Error jumps above 1.0 m, descent stops (hysteresis), drone re-centres, descent resumes |
+| Detection noise | With the marker at rest, the distance estimate varied by about ±1 mm. At gain 20 that is only ~2 cm of target movement, so most of the target jitter in these tests came from the hand, not the detector. Gain multiplies both equally |
+| Fast marker movement | Brief detection losses, most likely from motion blur |
+| Feedforward with step moves | Feedforward from the camera's velocity estimate overshot on sudden steps (drone went ~2 m when the target moved ~1 m). Feedforward helps for smooth motion but hurts for jumpy, noisy input |
+
+![Stage 3 follow test](stage3_follow.png)
+
+**Important limitation:** the webcam does not move with the drone, so this is not yet a closed loop through the camera. The camera only reports where the target is; the drone moving does not change what the camera sees. A real closed loop needs a camera mounted on the drone (Gazebo or hardware).
+
+## Landing cone
+
+Fixed tolerances (start descending below 0.5 m error, stop above 1.0 m) are fine at 10 m but too loose near the ground: the drone can touch down far from the target. With `--cone` the allowed error shrinks with height (0.5 m at 10 m, down to 0.15 m below 3 m; stop = 2x start). If the drone goes off-target below 1.5 m, it climbs back to 1.5 m, re-centres and descends again (a retry, like ArduPilot's built-in precision landing).
+
+Test: the target jumps 0.8 m sideways when the drone reaches 1.2 m (`--jump 0.8`).
+
+| Run | Behaviour after the jump | Touchdown error | Time to land |
+|---|---|---|---|
+| Fixed tolerance | Kept descending (0.8 m < 1.0 m stop limit), switched to LAND 0.27 m off | **0.17 m** | 19.5 s |
+| Cone | Stopped, climbed to ~1.8 m, re-centred, descended | **0.01 m** | 24.8 s |
+
+The cone trades about 5 s of landing time for a 17x smaller touchdown error.
+
+Note: earlier runs reported the error at 0.5 m height, just before LAND mode. The script now also reports the **touchdown error** (where the drone actually lands), because the drone keeps drifting during LAND.
+
+![Landing cone](cone_compare.png)
+
 ## Safety
 
 Both of these were tested in SITL:
 
 - **Ctrl+C** while flying puts the drone in `LAND` mode instead of leaving it hovering.
 - **Timeouts:** if the drone is not centred within 45 s, or the flight lasts more than 180 s, it switches to `RTL`.
+- **Marker lost (Stage 3):** unseen for 0.5 s -> hover and stop descending; unseen for 10 s -> `RTL`.
 
 ## How to run
 
@@ -63,6 +104,13 @@ python3 fake_target_land.py --move --ff --log ff.csv
 
 # Plot one or more runs
 python3 plot_logs.py p_only.csv kp15.csv ff.csv
+
+# Stage 2: marker detection only
+python3 aruco_webcam.py --make-marker        # print it, measure the black square
+python3 aruco_webcam.py --size 0.146 --hfov 68.2
+
+# Stage 3: webcam drives the SITL drone (follow for 40 s, then land)
+python3 aruco_sitl_land.py --gain 10 --hover 40 --log cam_move.csv
 ```
 
 Options:
@@ -71,6 +119,8 @@ Options:
 |---|---|
 | `--move` | Target moves on a circle |
 | `--ff` | Turn on feedforward |
+| `--cone` | Landing cone: allowed error shrinks with height, retry if off-target low down |
+| `--jump D` | Target jumps D m East when the drone first descends below 1.2 m |
 | `--log NAME.csv` | Save the run to a CSV file |
 | `--alt`, `--north`, `--east` | Takeoff height and target offset (m) |
 
@@ -80,8 +130,10 @@ Options:
 |---|---|
 | `fake_target_land.py` | Controller, safety logic, logging |
 | `plot_logs.py` | Error, height and top-down path plots |
-| `aruco_webcam.py` | Stage 2: ArUco marker detection with a webcam (in progress) |
-| `*.csv` | Logs of the runs in the table above |
+| `aruco_webcam.py` | Stage 2: ArUco marker detection and distance/angle estimate |
+| `aruco_sitl_land.py` | Stage 3: webcam marker detection drives the SITL drone |
+| `*.csv` | Logs of the runs above (`cam_*.csv` are Stage 3) |
+| `compare.png`, `stage3_*.png`, `cone_compare.png` | Plots of the runs |
 
 ## Limitations
 
@@ -89,10 +141,9 @@ Options:
 
 ## Next steps
 
-1. Detect an ArUco marker with a webcam and estimate its position.
-2. Feed the camera measurement into this controller instead of the simulated target.
-3. Compare with ArduPilot's built-in precision landing (`LANDING_TARGET` message).
-4. Test in Gazebo with a simulated downward camera, then on real hardware.
+1. Compare with ArduPilot's built-in precision landing (`PLND_*` parameters, simulated landing sensor).
+2. Test in Gazebo with a simulated downward camera, closing the loop through the camera.
+3. Calibrate a real drone camera (chessboard) and test on hardware.
 
 ## Author
 
