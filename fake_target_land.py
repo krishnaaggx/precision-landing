@@ -59,6 +59,14 @@ LOST_HOLD = 0.5      # target unseen this long (s) -> hover, stop descending
 LOST_CLIMB = 2.0     # target unseen this long (s) -> climb to get it back in view
 SEARCH_MAX_ALT = 8.0 # do not climb above this while searching (m)
 
+# ---- Camera tilt (--tilt, adds to --sensor) ----
+# The camera is fixed to the drone, so it tilts when the drone tilts to move.
+# 1) The view cone points where the camera points, not straight down.
+# 2) The image is SENS_DELAY old but is converted with the CURRENT attitude,
+#    so a change in attitude during that delay shifts the measured target by
+#    about height * (tan(angle now) - tan(angle then)).
+# Roll/pitch/yaw come from the SITL drone itself (ATTITUDE message).
+
 # velocity-only command: ignore position, acceleration, yaw, yaw rate
 VEL_ONLY_MASK = 0b0000110111000111
 MODES = {}
@@ -208,6 +216,8 @@ def main():
     ap.add_argument("--sensor", action="store_true",
                     help="see the target through a simulated camera: field of view, noise, delay")
     ap.add_argument("--seed", type=int, default=1, help="random seed for --sensor noise")
+    ap.add_argument("--tilt", action="store_true",
+                    help="camera tilts with the drone (needs --sensor): tilted view + attitude/delay error")
     ap.add_argument("--log", default=None, help="CSV log file name (default: log_HHMMSS.csv)")
     args = ap.parse_args()
 
@@ -218,6 +228,7 @@ def main():
     print(f"Vehicle found (system {m.target_system}, component {m.target_component})")
 
     request_rate(m, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 10)
+    request_rate(m, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 20)
     request_rate(m, mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT, 2)
 
     # If a previous run was stopped, the drone may still be in the air
@@ -353,7 +364,10 @@ def fly(m, args, log):
           + ("  [cone ON]" if args.cone else "")
           + (f"  [jump {args.jump} m at {args.jump_alt} m]" if args.jump else "")
           + (f"  [sensor: FOV {SENS_FOV:.0f} deg, noise {SENS_NOISE} deg, delay {SENS_DELAY} s]"
-             if args.sensor else ""))
+             if args.sensor else "")
+          + ("  [camera tilts with drone]" if args.sensor and args.tilt else ""))
+    att_hist = []        # (t, roll, pitch, yaw) for the tilt model
+    max_tilt_err = 0.0
     random.seed(args.seed)
     hist = []            # (t, true tx, true ty) for the delay
     est = None           # filtered target estimate (what the drone believes)
@@ -410,10 +424,30 @@ def fly(m, args, log):
             while len(hist) > 2 and hist[1][0] <= t - SENS_DELAY:
                 hist.pop(0)
             _, dtx, dty = hist[0]                         # target as it was SENS_DELAY ago
-            visible = true_dist <= max(alt, 0.05) * math.tan(math.radians(SENS_FOV))
+            h = max(alt, 0.05)
+            cam_n = cam_e = 0.0                           # where the camera axis hits the ground
+            tilt_n = tilt_e = 0.0                         # measurement error from attitude change
+            att = m.messages.get("ATTITUDE") if args.tilt else None
+            if att is not None:
+                att_hist.append((t, att.roll, att.pitch, att.yaw))
+                while len(att_hist) > 2 and att_hist[1][0] <= t - SENS_DELAY:
+                    att_hist.pop(0)
+                _, r_old, p_old, _ = att_hist[0]
+                r, p, yaw = att.roll, att.pitch, att.yaw
+                cy_, sy_ = math.cos(yaw), math.sin(yaw)
+                # nose down (p < 0) -> a down-facing camera looks backwards
+                fwd, right = h * math.tan(p), -h * math.tan(r)
+                cam_n, cam_e = cy_ * fwd - sy_ * right, sy_ * fwd + cy_ * right
+                dfwd = h * (math.tan(p) - math.tan(p_old))
+                dright = -h * (math.tan(r) - math.tan(r_old))
+                tilt_n, tilt_e = cy_ * dfwd - sy_ * dright, sy_ * dfwd + cy_ * dright
+                max_tilt_err = max(max_tilt_err, math.hypot(tilt_n, tilt_e))
+            off = math.hypot(tx - (pos.x + cam_n), ty - (pos.y + cam_e))
+            visible = off <= h * math.tan(math.radians(SENS_FOV))
             if visible:
                 sigma = max(alt, 0.3) * math.tan(math.radians(SENS_NOISE))
-                mx, my = dtx + random.gauss(0, sigma), dty + random.gauss(0, sigma)
+                mx = dtx + tilt_n + random.gauss(0, sigma)
+                my = dty + tilt_e + random.gauss(0, sigma)
                 est = (mx, my) if est is None else (est[0] + SENS_ALPHA * (mx - est[0]),
                                                     est[1] + SENS_ALPHA * (my - est[1]))
                 last_seen = t
@@ -483,6 +517,8 @@ def fly(m, args, log):
         # track the target down to LAND_ALT, then the final descent
         if alt < LAND_ALT and descending:
             print(f"Final error {true_dist:.2f} m at {alt:.1f} m -> final descent")
+            if args.sensor and args.tilt:
+                print(f"Largest tilt-induced measurement error during the flight: {max_tilt_err:.2f} m")
             final_descent(m, (ctx, cty), truth=(tx, ty))
             return True
 

@@ -93,6 +93,7 @@ To make the comparison fairer, my controller was also given a simulated camera (
 | Run | Normal landing: touchdown error | Pad jump at 1.2 m |
 |---|---|---|
 | My controller (cone + simulated camera) | **0.00 m** | **Lands, 0.01 m.** Target left the camera view at 1.1 m; the drone climbed to 1.4 m, saw it again, re-centred and landed |
+| My controller (cone + simulated camera that tilts with the drone, `--tilt`) | **0.00 m** | **Lands, 0.01 m.** Same recovery as above |
 | ArduPilot 4.7.2 (latest stable) | 0.13 m | **Did not land in 60 s.** Swung up to 9.8 m away at 0.5 m height |
 | ArduPilot 4.5.7 | 0.18 m | Did not land in 60 s (up to 7.2 m away) |
 | ArduPilot 4.8.0-dev | 0.10 m | Did not land in 60 s, in 3 of 3 runs (up to 9.8 m away) |
@@ -108,9 +109,14 @@ The swinging was checked visually in QGroundControl, not only from the logged nu
 - In all three firmware versions, about 2 s after touchdown ArduPilot reported "Target Lost", then started a retry and lifted off again. The script now detects touchdown itself and disarms (SITL only).
 - `SIM_PLD_LAT/LON` are 32-bit floats: at longitude 77 that is a ~0.75 m step. The script reads the stored values back and measures against those.
 
-**Why this is not a fair win for my controller (yet):**
+**Camera tilt (`--tilt`):** the camera is fixed to the drone, so when the drone tilts to move, the view cone tilts too, and because the image is 0.15 s old but is converted with the current attitude, a change in attitude shifts the measured target by about `height x (tan(angle now) - tan(angle 0.15 s ago))`. Roll, pitch and yaw come from the SITL drone itself. With tilt:
 
-- My camera model ignores the drone's tilt. A real camera tilts with the drone when it accelerates, which shifts where the target appears. ArduPilot's estimator has to deal with that; mine does not.
+- At the start (10 m up, pad 4.5 m away) the drone tilted towards the pad, the camera looked away from it and the target left the view for 0.5 s. The drone hovered, the target came back, and it continued.
+- The largest tilt-induced measurement error was 1.47 m (normal run) and 1.42 m (jump run), most likely during that first sideways move. During the descent the drone is nearly level, and the error there was a few centimetres.
+- Both runs still landed within 0.01 m.
+
+**Why this is still not a fair win for my controller:**
+
 - I chose the camera noise, delay and field of view myself. They are not measured from a real sensor, and ArduPilot's simulated sensor has its own, different model.
 - A pad that teleports 0.8 m in one step is an extreme test. ArduPilot's documentation says its estimator assumes a stationary target.
 - My controller uses the drone's own position estimate, which in SITL is close to perfect.
@@ -163,6 +169,7 @@ Options:
 | `--cone` | Landing cone: allowed error shrinks with height, retry if off-target low down |
 | `--jump D` | Target jumps D m East when the drone first descends below 1.2 m |
 | `--sensor` | See the target through a simulated camera (30 deg view, noise, delay); hover and climb if it is lost |
+| `--tilt` | With `--sensor`: the camera tilts with the drone (tilted view, attitude-change error) |
 | `--log NAME.csv` | Save the run to a CSV file |
 | `--alt`, `--north`, `--east` | Takeoff height and target offset (m) |
 
@@ -184,10 +191,9 @@ Options:
 
 ## Next steps
 
-1. Add the drone's tilt to the camera model and repeat the Stage 4 comparison.
-2. Report the ArduPilot behaviour (no recovery after a target jump, retry after touchdown) on the ArduPilot forum with the logs.
-3. Test in Gazebo with a simulated downward camera, closing the loop through the camera.
-4. Calibrate a real drone camera (chessboard) and test on hardware.
+1. Report the ArduPilot behaviour (no recovery after a target jump, retry after touchdown) on the ArduPilot forum with the logs.
+2. Test in Gazebo with a simulated downward camera, closing the loop through the camera.
+3. Calibrate a real drone camera (chessboard) and test on hardware.
 
 ## Author
 
