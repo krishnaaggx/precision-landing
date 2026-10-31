@@ -65,6 +65,7 @@ class Shared:
         self.stop = False
         self.done = False        # control thread finished (landed / RTL)
         self.target = None       # target position when LAND started
+        self.landed = False      # final descent done and disarmed
 
 
 def control_loop(m, args, shared, log):
@@ -157,9 +158,9 @@ def control_loop(m, args, shared, log):
                 last_print = t
 
             if alt < ftl.LAND_ALT and descending:
-                print(f"Final error {dist:.2f} m at {alt:.1f} m -> LAND")
-                ftl.set_mode(m, "LAND")
-                shared.target = (tx, ty)
+                print(f"Final error {dist:.2f} m at {alt:.1f} m -> final descent")
+                ftl.final_descent(m, (tx, ty))
+                shared.landed = True
                 return
     finally:
         shared.done = True
@@ -278,10 +279,12 @@ def main():
     log.close()
 
     if user_stop and not shared.done:
-        print("Stopped by user -> LAND")
-        ftl.set_mode(m, "LAND")
+        print("Stopped by user -> coming straight down")
+        ftl.final_descent(m, None)
+        shared.landed = True
 
-    ftl.wait_disarm(m, shared.target)
+    if not shared.landed:   # RTL safety case
+        ftl.wait_disarm(m)
 
 
 if __name__ == "__main__":

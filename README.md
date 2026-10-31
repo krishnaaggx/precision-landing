@@ -5,6 +5,7 @@ A closed-loop controller that flies an ArduCopter drone over a target and lands 
 - **Stage 1:** the target position is simulated (fixed or moving on a circle).
 - **Stage 2:** an ArUco marker is detected with a webcam and its position estimated.
 - **Stage 3:** the webcam detection drives the simulated drone in real time.
+- **Stage 4:** comparison with ArduPilot's built-in precision landing, on three firmware versions.
 
 ## What it does
 
@@ -83,6 +84,41 @@ Note: earlier runs reported the error at 0.5 m height, just before LAND mode. Th
 
 ![Landing cone](cone_compare.png)
 
+## Stage 4: comparison with ArduPilot's built-in precision landing
+
+`builtin_precland.py` runs ArduPilot's own precision landing (`PLND_TYPE 4`, the SITL landing-target sensor, with a simulated rangefinder) on the same test as my controller: pad 5 m East, descent from 10 m, and optionally the pad jumping 0.8 m sideways when the drone reaches 1.2 m. ArduPilot parameters were left at their defaults.
+
+To make the comparison fairer, my controller was also given a simulated camera (`--sensor`): the target is only visible inside a 30 degree cone below the drone, with 0.5 degree angle noise, a 0.15 s delay and a low-pass filter. If the target leaves the view, the drone hovers, then climbs until it sees the target again.
+
+| Run | Normal landing: touchdown error | Pad jump at 1.2 m |
+|---|---|---|
+| My controller (cone + simulated camera) | **0.00 m** | **Lands, 0.01 m.** Target left the camera view at 1.1 m; the drone climbed to 1.4 m, saw it again, re-centred and landed |
+| ArduPilot 4.7.2 (latest stable) | 0.13 m | **Did not land in 60 s.** Swung up to 9.8 m away at 0.5 m height |
+| ArduPilot 4.5.7 | 0.18 m | Did not land in 60 s (up to 7.2 m away) |
+| ArduPilot 4.8.0-dev | 0.10 m | Did not land in 60 s, in 3 of 3 runs (up to 9.8 m away) |
+| ArduPilot 4.7.2, `PLND_OPTIONS=1` (moving target) | n/a | Did not land in 60 s. Also oscillated before the jump (mean error 0.76 m vs 0.14 m with defaults) |
+
+The swinging was checked visually in QGroundControl, not only from the logged numbers.
+
+![Stage 4: pad jump](stage4_jump.png)
+
+**Other observations:**
+
+- ArduPilot held a constant ~0.13 m offset from the pad for the whole descent. I do not know the cause yet.
+- In all three firmware versions, about 2 s after touchdown ArduPilot reported "Target Lost", then started a retry and lifted off again. The script now detects touchdown itself and disarms (SITL only).
+- `SIM_PLD_LAT/LON` are 32-bit floats: at longitude 77 that is a ~0.75 m step. The script reads the stored values back and measures against those.
+
+**Why this is not a fair win for my controller (yet):**
+
+- My camera model ignores the drone's tilt. A real camera tilts with the drone when it accelerates, which shifts where the target appears. ArduPilot's estimator has to deal with that; mine does not.
+- I chose the camera noise, delay and field of view myself. They are not measured from a real sensor, and ArduPilot's simulated sensor has its own, different model.
+- A pad that teleports 0.8 m in one step is an extreme test. ArduPilot's documentation says its estimator assumes a stationary target.
+- My controller uses the drone's own position estimate, which in SITL is close to perfect.
+
+So the honest conclusion is: with default settings, ArduPilot's precision landing in SITL did not recover from a sudden 0.8 m target jump near the ground in any of the three versions tested, while a simple cone + "climb to regain view" strategy did. Whether that holds with tilt, real sensor noise and real hardware is the next thing to test.
+
+![Stage 4: normal landing](stage4_land.png)
+
 ## Safety
 
 Both of these were tested in SITL:
@@ -111,6 +147,11 @@ python3 aruco_webcam.py --size 0.146 --hfov 68.2
 
 # Stage 3: webcam drives the SITL drone (follow for 40 s, then land)
 python3 aruco_sitl_land.py --gain 10 --hover 40 --log cam_move.csv
+
+# Stage 4: ArduPilot's built-in precision landing (setup once, then restart SITL without -w)
+python3 builtin_precland.py --setup
+python3 builtin_precland.py --jump 0.8 --log ap_jump.csv
+python3 fake_target_land.py --north 0 --east 5 --cone --sensor --jump 0.8 --log our_jump_sensor.csv
 ```
 
 Options:
@@ -121,6 +162,7 @@ Options:
 | `--ff` | Turn on feedforward |
 | `--cone` | Landing cone: allowed error shrinks with height, retry if off-target low down |
 | `--jump D` | Target jumps D m East when the drone first descends below 1.2 m |
+| `--sensor` | See the target through a simulated camera (30 deg view, noise, delay); hover and climb if it is lost |
 | `--log NAME.csv` | Save the run to a CSV file |
 | `--alt`, `--north`, `--east` | Takeoff height and target offset (m) |
 
@@ -132,8 +174,9 @@ Options:
 | `plot_logs.py` | Error, height and top-down path plots |
 | `aruco_webcam.py` | Stage 2: ArUco marker detection and distance/angle estimate |
 | `aruco_sitl_land.py` | Stage 3: webcam marker detection drives the SITL drone |
-| `*.csv` | Logs of the runs above (`cam_*.csv` are Stage 3) |
-| `compare.png`, `stage3_*.png`, `cone_compare.png` | Plots of the runs |
+| `builtin_precland.py` | Stage 4: ArduPilot's built-in precision landing on the same test (`--setup` once) |
+| `*.csv` | Logs of the runs above (`cam_*.csv` Stage 3, `our_*.csv` / `ap_*.csv` Stage 4) |
+| `compare.png`, `stage3_*.png`, `cone_compare.png`, `stage4_*.png` | Plots of the runs |
 
 ## Limitations
 
@@ -141,9 +184,10 @@ Options:
 
 ## Next steps
 
-1. Compare with ArduPilot's built-in precision landing (`PLND_*` parameters, simulated landing sensor).
-2. Test in Gazebo with a simulated downward camera, closing the loop through the camera.
-3. Calibrate a real drone camera (chessboard) and test on hardware.
+1. Add the drone's tilt to the camera model and repeat the Stage 4 comparison.
+2. Report the ArduPilot behaviour (no recovery after a target jump, retry after touchdown) on the ArduPilot forum with the logs.
+3. Test in Gazebo with a simulated downward camera, closing the loop through the camera.
+4. Calibrate a real drone camera (chessboard) and test on hardware.
 
 ## Author
 

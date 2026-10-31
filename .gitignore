@@ -8,3 +8,11 @@ log_*.csv
 
 # macOS
 .DS_Store
+
+# SITL files (created when sim_vehicle.py is started in this folder)
+eeprom.bin
+mav.parm
+mav.tlog
+mav.tlog.raw
+terrain/
+logs/

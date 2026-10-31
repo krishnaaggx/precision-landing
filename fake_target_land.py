@@ -24,6 +24,7 @@ QGC keep their own connection.
 
 import argparse
 import math
+import random
 import time
 
 from pymavlink import mavutil
@@ -46,6 +47,17 @@ CONE_SLOPE = 0.05   # allowed start error per metre of height (0.5 m at 10 m)
 CONE_MIN = 0.15     # never stricter than this (m), or noise would stop every descent
 RETRY_ALT = 1.5     # off-target below this height -> climb back up to it
 RETRY_CLIMB = 0.5   # climb speed for a retry (m/s)
+
+# ---- Simulated sensor (--sensor) ----
+# Without --sensor the controller knows the target position exactly. With it,
+# the target is seen the way a downward camera would see it.
+SENS_FOV = 30.0      # half-angle of the camera cone (deg): target visible only inside it
+SENS_NOISE = 0.5     # angle noise, 1 sigma (deg) -> position noise grows with height
+SENS_DELAY = 0.15    # image processing delay (s)
+SENS_ALPHA = 0.3     # low-pass filter on the measurement (0..1)
+LOST_HOLD = 0.5      # target unseen this long (s) -> hover, stop descending
+LOST_CLIMB = 2.0     # target unseen this long (s) -> climb to get it back in view
+SEARCH_MAX_ALT = 8.0 # do not climb above this while searching (m)
 
 # velocity-only command: ignore position, acceleration, yaw, yaw rate
 VEL_ONLY_MASK = 0b0000110111000111
@@ -157,6 +169,22 @@ def takeoff(m, alt, timeout=40):
             return
 
 
+def climb_to(m, alt, timeout=30):
+    """GUIDED takeoff often stops short (~8 m). Climb the rest so every run starts at the same height."""
+    end = time.time() + timeout
+    while time.time() < end:
+        pos = recv(m, "LOCAL_POSITION_NED", timeout=1)
+        if pos is None:
+            continue
+        err = alt - (-pos.z)
+        if abs(err) < 0.15 and abs(pos.vz) < 0.1:
+            print(f"At {alt:.1f} m.")
+            return
+        vz = max(-1.0, min(1.0, -0.8 * err))     # negative = climb
+        send_velocity(m, 0.0, 0.0, vz)
+    print("Could not reach the start height exactly, continuing.")
+
+
 def send_velocity(m, vx, vy, vz):
     """NED frame: vx = North, vy = East, vz = Down (positive = descend)."""
     m.mav.set_position_target_local_ned_send(
@@ -177,6 +205,9 @@ def main():
     ap.add_argument("--jump", type=float, default=0.0,
                     help="target jumps this far East (m) when the drone first descends below --jump-alt")
     ap.add_argument("--jump-alt", type=float, default=1.2, help="height for --jump (m)")
+    ap.add_argument("--sensor", action="store_true",
+                    help="see the target through a simulated camera: field of view, noise, delay")
+    ap.add_argument("--seed", type=int, default=1, help="random seed for --sensor noise")
     ap.add_argument("--log", default=None, help="CSV log file name (default: log_HHMMSS.csv)")
     args = ap.parse_args()
 
@@ -196,42 +227,113 @@ def main():
     if hb and is_armed(hb) and pos0 and -pos0.z > 2.0:
         print(f"Already airborne ({-pos0.z:.1f} m), skipping takeoff.")
     else:
+        if hb and is_armed(hb):
+            # armed but on the ground (left over from an earlier run): takeoff
+            # is often refused in this state, so start clean
+            print("Armed on the ground from an earlier run -> disarming first")
+            disarm(m)
         arm(m)
         takeoff(m, args.alt)
+    climb_to(m, args.alt)
 
     log_name = args.log or time.strftime("log_%H%M%S.csv")
     log = open(log_name, "w")
     log.write("t,error,alt,tx,ty,x,y,vx,vy,vz,descending\n")
     print(f"Log: {log_name}")
 
-    target = None
+    landed = False
     try:
-        target = fly(m, args, log)
+        landed = fly(m, args, log)
     except KeyboardInterrupt:
         # never leave the drone hovering when the script stops
-        print("\nCtrl+C! Switching to LAND...")
-        set_mode(m, "LAND")
+        print("\nCtrl+C! Coming straight down...")
+        final_descent(m, None)
+        landed = True
     finally:
         log.close()
 
-    wait_disarm(m, target)
+    if not landed:          # RTL safety case
+        wait_disarm(m)
 
 
-def wait_disarm(m, target=None):
-    """Wait for touchdown; report where the drone actually landed."""
+def wait_disarm(m, target=None, timeout=120):
+    """Wait for touchdown (e.g. after RTL); disarm if it sits on the ground armed."""
     last = None
-    while True:
+    still = None
+    end = time.time() + timeout
+    while time.time() < end:
         msg = recv(m, ["HEARTBEAT", "LOCAL_POSITION_NED"], timeout=2)
         if msg is None:
             continue
         if msg.get_type() == "LOCAL_POSITION_NED":
             last = msg
+            if -msg.z < 0.2 and abs(msg.vz) < 0.1:
+                still = still or time.time()
+                if time.time() - still > 3:
+                    print("On the ground but still armed -> disarming (SITL)")
+                    disarm(m)
+            else:
+                still = None
         elif not is_armed(msg):
             if target and last:
                 err = math.hypot(target[0] - last.x, target[1] - last.y)
                 print(f"Touchdown error: {err:.2f} m")
             print("Landed + DISARMED. Done.")
             return
+    print("Timed out waiting for disarm - check QGC.")
+
+
+def disarm(m):
+    """Normal disarm first; if refused, force it (magic 21196). Only safe in SITL."""
+    for force in (0, 21196):
+        m.mav.command_long_send(m.target_system, m.target_component,
+                                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                                0, force, 0, 0, 0, 0, 0)
+        end = time.time() + 3
+        while time.time() < end:
+            hb = recv(m, "HEARTBEAT", timeout=1)
+            if hb and not is_armed(hb):
+                print("DISARMED")
+                return True
+    print("Disarm failed - disarm from QGC or MAVProxy (disarm force).")
+    return False
+
+
+def final_descent(m, target=None, timeout=60, truth=None):
+    """
+    Last part of the landing in GUIDED, still tracking the target, then disarm.
+
+    We do NOT use LAND mode here: with PLND_ENABLED=1, LAND runs ArduPilot's
+    own precision landing, which would take over from our controller.
+    target = (x, y) in local NED, or None to come straight down.
+    """
+    still = None
+    last = None
+    end = time.time() + timeout
+    while time.time() < end:
+        pos = recv(m, "LOCAL_POSITION_NED", timeout=1)
+        if pos is None:
+            continue
+        last = pos
+        vx = vy = 0.0
+        if target:
+            vx, vy = KP * (target[0] - pos.x), KP * (target[1] - pos.y)
+            sp = math.hypot(vx, vy)
+            if sp > 0.3:                      # gentle near the ground
+                vx, vy = vx * 0.3 / sp, vy * 0.3 / sp
+        send_velocity(m, vx, vy, SLOW_DESCENT)
+        if -pos.z < 0.2 and abs(pos.vz) < 0.1:
+            still = still or time.time()
+            if time.time() - still > 1.0:
+                break
+        else:
+            still = None
+    ref = truth or target
+    if ref and last:
+        err = math.hypot(ref[0] - last.x, ref[1] - last.y)
+        print(f"Touchdown error: {err:.2f} m")
+    disarm(m)
+    print("Landed + DISARMED. Done.")
 
 
 def tolerances(alt, cone):
@@ -249,7 +351,14 @@ def fly(m, args, log):
           + ("  (moving)" if args.move else "")
           + ("  [feedforward ON]" if args.ff else "")
           + ("  [cone ON]" if args.cone else "")
-          + (f"  [jump {args.jump} m at {args.jump_alt} m]" if args.jump else ""))
+          + (f"  [jump {args.jump} m at {args.jump_alt} m]" if args.jump else "")
+          + (f"  [sensor: FOV {SENS_FOV:.0f} deg, noise {SENS_NOISE} deg, delay {SENS_DELAY} s]"
+             if args.sensor else ""))
+    random.seed(args.seed)
+    hist = []            # (t, true tx, true ty) for the delay
+    est = None           # filtered target estimate (what the drone believes)
+    last_seen = None
+    searching = False
 
     t0 = time.time()
     last_print = 0.0
@@ -267,11 +376,11 @@ def fly(m, args, log):
         if not ever_centered and t > CENTER_TIMEOUT:
             print(f"SAFETY: not centred within {CENTER_TIMEOUT}s -> RTL")
             set_mode(m, "RTL")
-            return None
+            return False
         if t > MAX_FLIGHT:
             print(f"SAFETY: {MAX_FLIGHT}s flight limit -> RTL")
             set_mode(m, "RTL")
-            return None
+            return False
 
         alt = -pos.z
 
@@ -293,9 +402,34 @@ def fly(m, args, log):
             tx, ty = cx, cy
             tvx, tvy = 0.0, 0.0             # target at rest
 
+        true_dist = math.hypot(tx - pos.x, ty - pos.y)
+
+        # ---- simulated camera: what the drone actually knows ----
+        if args.sensor:
+            hist.append((t, tx, ty))
+            while len(hist) > 2 and hist[1][0] <= t - SENS_DELAY:
+                hist.pop(0)
+            _, dtx, dty = hist[0]                         # target as it was SENS_DELAY ago
+            visible = true_dist <= max(alt, 0.05) * math.tan(math.radians(SENS_FOV))
+            if visible:
+                sigma = max(alt, 0.3) * math.tan(math.radians(SENS_NOISE))
+                mx, my = dtx + random.gauss(0, sigma), dty + random.gauss(0, sigma)
+                est = (mx, my) if est is None else (est[0] + SENS_ALPHA * (mx - est[0]),
+                                                    est[1] + SENS_ALPHA * (my - est[1]))
+                last_seen = t
+                if searching:
+                    print(f"t={t:5.1f}s  target back in view at {alt:.1f} m")
+                    searching = False
+            lost_for = (t - last_seen) if last_seen is not None else float("inf")
+            ctx, cty = est if est is not None else (tx, ty)
+            tvx = tvy = 0.0                               # no velocity from the camera
+        else:
+            lost_for = 0.0
+            ctx, cty = tx, ty
+
         # ---- error -> velocity (P + feedforward + speed limit) ----
-        ex, ey = tx - pos.x, ty - pos.y
-        dist = math.hypot(ex, ey)
+        ex, ey = ctx - pos.x, cty - pos.y
+        dist = math.hypot(ex, ey)                         # error the drone believes
         vx, vy = KP * ex, KP * ey
         if args.ff:
             vx += tvx
@@ -325,20 +459,32 @@ def fly(m, args, log):
         else:
             vz = 0.0
 
+        # ---- target not visible: hover, then climb until it is back in view ----
+        if args.sensor and lost_for > LOST_HOLD:
+            vx = vy = 0.0
+            descending = False
+            retrying = False
+            vz = -RETRY_CLIMB if (lost_for > LOST_CLIMB and alt < SEARCH_MAX_ALT) else 0.0
+            if not searching:
+                print(f"t={t:5.1f}s  TARGET NOT VISIBLE at {alt:.1f} m -> hover, then climb")
+                searching = True
+
         send_velocity(m, vx, vy, vz)
-        log.write(f"{t:.2f},{dist:.3f},{alt:.2f},{tx:.3f},{ty:.3f},"
+        log.write(f"{t:.2f},{true_dist:.3f},{alt:.2f},{tx:.3f},{ty:.3f},"
                   f"{pos.x:.3f},{pos.y:.3f},{vx:.3f},{vy:.3f},{vz:.3f},{int(descending)}\n")
 
         if t - last_print > 1.0:
-            state = "RETRY" if retrying else ("DESCENDING" if descending else "CENTRING")
-            print(f"t={t:5.1f}s  error={dist:5.2f} m  height={alt:5.1f} m  {state}")
+            state = ("SEARCH" if searching else "RETRY" if retrying
+                     else "DESCENDING" if descending else "CENTRING")
+            extra = f"  (believed {dist:4.2f} m)" if args.sensor else ""
+            print(f"t={t:5.1f}s  error={true_dist:5.2f} m{extra}  height={alt:5.1f} m  {state}")
             last_print = t
 
-        # track the target down to LAND_ALT, then LAND
+        # track the target down to LAND_ALT, then the final descent
         if alt < LAND_ALT and descending:
-            print(f"Final error {dist:.2f} m at {alt:.1f} m -> LAND mode")
-            set_mode(m, "LAND")
-            return tx, ty
+            print(f"Final error {true_dist:.2f} m at {alt:.1f} m -> final descent")
+            final_descent(m, (ctx, cty), truth=(tx, ty))
+            return True
 
 if __name__ == "__main__":
     main()
